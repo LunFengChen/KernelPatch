@@ -1,0 +1,93 @@
+name: Build kptools for Windows
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version tag (e.g., 0.12.7)'
+        required: false
+        default: 'latest'
+  push:
+    branches:
+      - main
+    paths:
+      - 'tools/**'
+      - '.github/workflows/build-windows.yml'
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-make
+            mingw-w64-x86_64-zlib
+            make
+      
+      - name: Build kptools
+        shell: msys2 {0}
+        run: |
+          cd tools
+          make clean
+          make CC=gcc
+          
+          # Verify build
+          if [ -f kptools.exe ] || [ -f kptools ]; then
+            echo "✅ kptools built successfully"
+            ls -lh kptools* || true
+          else
+            echo "❌ kptools build failed"
+            exit 1
+          fi
+      
+      - name: Get version
+        id: version
+        shell: bash
+        run: |
+          if [ -f version ]; then
+            VERSION=$(cat version | tr -d '\n\r')
+          else
+            VERSION="unknown"
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Version: $VERSION"
+      
+      - name: Rename binary
+        shell: msys2 {0}
+        run: |
+          cd tools
+          if [ -f kptools.exe ]; then
+            mv kptools.exe kptools-windows-x64.exe
+          elif [ -f kptools ]; then
+            mv kptools kptools-windows-x64.exe
+          fi
+          
+          # Show file info
+          ls -lh kptools-windows-x64.exe
+          file kptools-windows-x64.exe || true
+      
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: kptools-windows-${{ steps.version.outputs.version }}
+          path: tools/kptools-windows-x64.exe
+          if-no-files-found: error
+      
+      - name: Create Release (if tagged)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v1
+        with:
+          files: tools/kptools-windows-x64.exe
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
