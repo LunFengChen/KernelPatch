@@ -33,15 +33,13 @@ jobs:
             mingw-w64-x86_64-zlib
             make
       
-      - name: Copy preset.h
-        shell: bash
-        run: |
-          cp kernel/include/preset.h tools/
-          echo "✅ preset.h copied"
-      
       - name: Build kptools
         shell: msys2 {0}
         run: |
+          # Copy preset.h to tools directory
+          cp kernel/include/preset.h tools/
+          echo "✅ preset.h copied to tools/"
+          
           cd tools
           make clean
           make CC=gcc
