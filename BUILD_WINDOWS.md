@@ -27,6 +27,10 @@ pacman -S mingw-w64-x86_64-gcc mingw-w64-x86_64-make mingw-w64-x86_64-zlib make
 ### 编译
 
 ```bash
+# 复制 preset.h
+cp ../kernel/include/preset.h .
+
+# 编译
 cd tools
 make clean
 make CC=gcc
