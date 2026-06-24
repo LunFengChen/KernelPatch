@@ -14,6 +14,8 @@
 #include <string.h>
 #include <ctype.h>
 
+#include "kallsym.h"
+#include "bootimg.h"
 #include "patch.h"
 #include "kallsym.h"
 #include "image.h"
@@ -22,7 +24,7 @@
 #include "preset.h"
 #include "symbol.h"
 #include "kpm.h"
-#include "sha256.h"
+#include "lib/sha/sha256.h"
 
 void read_kernel_file(const char *path, kernel_file_t *kernel_file)
 {
@@ -365,7 +367,7 @@ static void hexstr_to_bytes(const char *hexstr, size_t out_len, unsigned char *o
     }
 }
 
-static void hex_patch(char *img, size_t imglen,
+int hex_patch(char *img, size_t imglen,
                       const char *pattern_hex,
                       const char *replace_hex)
 {
@@ -382,12 +384,15 @@ static void hex_patch(char *img, size_t imglen,
     unsigned char *p = memmem(img, imglen, pattern, patternlen);
     if (p) {
         memcpy(p, replace, replacelen);
+    }else{
+        return -1;
     }
+    return 0;
 }
 
-static void disable_pi_map(char *img, size_t imglen)
+static int disable_pi_map(char *img, size_t imglen)
 {
-    hex_patch(
+    return hex_patch(
         img,
         imglen,
         "E60316AAE7031F2A3411889A",
@@ -402,7 +407,7 @@ int patch_update_img(const char *kimg_path, const char *kpimg_path, const char *
 
     if (!kpimg_path) tools_loge_exit("empty kpimg\n");
     if (!out_path) tools_loge_exit("empty out image path\n");
-    if (!superkey) tools_loge_exit("empty superkey\n");
+    if (!superkey && !root_key) tools_loge_exit("empty superkey\n");
 
     patched_kimg_t pimg = { 0 };
     kernel_file_t kernel_file;
@@ -421,8 +426,20 @@ int patch_update_img(const char *kimg_path, const char *kpimg_path, const char *
     char *kallsym_kimg = (char *)malloc(pimg.ori_kimg_len);
     memcpy(kallsym_kimg, pimg.kimg, pimg.ori_kimg_len);
     kallsym_t kallsym = { 0 };
-
-    if (kernel_if_need_patch(&kallsym, kallsym_kimg ,pimg.ori_kimg_len))disable_pi_map(kernel_file.kimg, kernel_file.kimg_len);
+    int kver = 0;
+    find_linux_banner(&kallsym, kallsym_kimg, pimg.ori_kimg_len, &kver);
+    bool is_gki = kver >= 330240;  // 5.10
+    tools_logi("is_gki: %s\n", is_gki ? "true" : "false");
+    if (kver > 395008) {
+        if(disable_pi_map(kernel_file.kimg, kernel_file.kimg_len))   //395008= (6<<16)+(7<<8)
+        {
+            tools_logi("kernel have patched or not found\n");
+        }else{
+            tools_logi("disabled PI_MAP for kernel version > 6.12.23\n");
+        }
+        
+        
+    }
     
     if (analyze_kallsym_info(&kallsym, kallsym_kimg, pimg.ori_kimg_len, ARM64, 1)) {
         tools_loge_exit("analyze_kallsym_info error\n");
@@ -561,13 +578,12 @@ int patch_update_img(const char *kimg_path, const char *kpimg_path, const char *
     setup->extra_size = extra_size;
 
     int map_start, map_max_size;
-    select_map_area(&kallsym, kallsym_kimg, &map_start, &map_max_size);
+    select_map_area(&kallsym, kallsym_kimg, pimg.ori_kimg_len, &map_start, &map_max_size, is_gki);
     setup->map_offset = map_start;
     setup->map_max_size = map_max_size;
     tools_logi("map_start: 0x%x, max_size: 0x%x\n", map_start, map_max_size);
 
-    int tcp_init_sock_offset = get_symbol_offset_exit(&kallsym, kallsym_kimg, "tcp_init_sock");
-    int sync_start = tcp_init_sock_offset;
+    int sync_start = map_start;
     int sync_size = map_max_size * 2;
     if (sync_start + sync_size > ori_kimg_len) {
         sync_size = ori_kimg_len - sync_start;
@@ -578,7 +594,20 @@ int patch_update_img(const char *kimg_path, const char *kpimg_path, const char *
                    sync_start, sync_size);
     }
 
-    setup->kallsyms_lookup_name_offset = get_symbol_offset_exit(&kallsym, kallsym_kimg, "kallsyms_lookup_name");
+    const char *symbol_lookup_anchor_name = 0;
+    setup->sprintf_offset = get_usable_symbol_offset_try(&kallsym, kallsym_kimg, ori_kimg_len, "sprintf");
+    setup->symbol_lookup_anchor_offset =
+        select_symbol_lookup_anchor_offset(&kallsym, kallsym_kimg, ori_kimg_len, &symbol_lookup_anchor_name);
+    setup->kallsyms_lookup_name_offset =
+        get_usable_symbol_offset_try(&kallsym, kallsym_kimg, ori_kimg_len, "kallsyms_lookup_name");
+    if (setup->symbol_lookup_anchor_offset && setup->sprintf_offset) {
+        tools_logi("prefer runtime forward scan anchor for kallsyms_lookup_name: %s, offset: 0x%08lx\n",
+                   symbol_lookup_anchor_name, (unsigned long)setup->symbol_lookup_anchor_offset);
+    } else if (setup->kallsyms_lookup_name_offset) {
+        tools_logi("fallback to direct kallsyms_lookup_name symbol\n");
+    } else {
+        tools_loge_exit("no usable symbol scan anchor/sprintf chain and no kallsyms_lookup_name symbol\n");
+    }
 
     setup->printk_offset = get_symbol_offset_zero(&kallsym, kallsym_kimg, "printk");
     if (!setup->printk_offset) setup->printk_offset = get_symbol_offset_zero(&kallsym, kallsym_kimg, "_printk");
@@ -594,6 +623,8 @@ int patch_update_img(const char *kimg_path, const char *kpimg_path, const char *
         setup->map_offset = i64swp(setup->map_offset);
         setup->map_max_size = i64swp(setup->map_max_size);
         setup->kallsyms_lookup_name_offset = i64swp(setup->kallsyms_lookup_name_offset);
+        setup->sprintf_offset = i64swp(setup->sprintf_offset);
+        setup->symbol_lookup_anchor_offset = i64swp(setup->symbol_lookup_anchor_offset);
         setup->paging_init_offset = i64swp(setup->paging_init_offset);
         setup->printk_offset = i64swp(setup->printk_offset);
     }
@@ -611,7 +642,7 @@ int patch_update_img(const char *kimg_path, const char *kpimg_path, const char *
     if (!root_key) {
         tools_logi("superkey: %s\n", superkey);
         strncpy((char *)setup->superkey, superkey, SUPER_KEY_LEN - 1);
-    } else {
+    } else if (superkey && superkey[0] != '\0') {
         int len = SHA256_BLOCK_SIZE > ROOT_SUPER_KEY_HASH_LEN ? ROOT_SUPER_KEY_HASH_LEN : SHA256_BLOCK_SIZE;
         BYTE buf[SHA256_BLOCK_SIZE];
         SHA256_CTX ctx;
@@ -622,6 +653,9 @@ int patch_update_img(const char *kimg_path, const char *kpimg_path, const char *
         char *hexstr = bytes_to_hexstr(setup->root_superkey, len);
         tools_logi("root superkey hash: %s\n", hexstr);
         free(hexstr);
+    } else {
+        memset(setup->root_superkey, 0, ROOT_SUPER_KEY_HASH_LEN);
+        tools_logi("root_key mode with empty superkey: root_superkey zeroed\n");
     }
 
     // modify kernel entry
